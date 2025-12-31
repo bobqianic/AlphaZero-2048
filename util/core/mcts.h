@@ -34,6 +34,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -41,7 +42,6 @@ namespace agmcts {
 
 // ---------------------------
 // MinMaxStats (MuZero-style)
-// Keeps value ranges stable by normalizing Q into [0,1] during selection.
 // ---------------------------
 struct MinMaxStats {
   double minimum =  std::numeric_limits<double>::infinity();
@@ -74,12 +74,9 @@ struct MCTSConfig {
   int num_simulations = 800;
   double cpuct = 1.5;
 
-  // Root Dirichlet noise (AlphaGo Zero):
-  // Set dirichlet_epsilon = 0 to disable.
   double dirichlet_alpha = 0.3;
   double dirichlet_epsilon = 0.25;
 
-  // Temperature for converting visit counts into a policy.
   double temperature = 1.0;
 
   uint64_t seed = 0xC0FFEEULL;
@@ -95,7 +92,6 @@ struct Evaluation {
   Payload payload{};
 };
 
-// Default: no payload
 using NoPayload = struct {};
 
 // ---------------------------
@@ -147,14 +143,14 @@ struct DefaultBackupStrategy {
   using BackupValue = double;
 
   static BackupValue make_leaf_value(double leaf_value,
-                                    const EvalPayload* /*payload*/,
-                                    const State& /*leaf_state*/) {
+                                     const EvalPayload* /*payload*/,
+                                     const State& /*leaf_state*/) {
     return leaf_value;
   }
 
   static BackupValue move_to_parent(const BackupValue& v,
-                                   const State& /*parent_state*/,
-                                   const State& /*child_state*/) {
+                                    const State& /*parent_state*/,
+                                    const State& /*child_state*/) {
     return -v;
   }
 
@@ -189,6 +185,41 @@ inline std::vector<double> sample_dirichlet(std::mt19937_64& rng, int k, double 
   for (double& v : x) v /= sum;
   return x;
 }
+
+// ---------------------------
+// Chance-node detection (optional State API)
+// ---------------------------
+namespace detail {
+template <typename T, typename = void>
+struct has_is_chance_node : std::false_type {};
+
+template <typename T>
+struct has_is_chance_node<T, std::void_t<decltype(std::declval<const T&>().is_chance_node())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_chance_priors : std::false_type {};
+
+template <typename T>
+struct has_chance_priors<T, std::void_t<decltype(std::declval<const T&>().chance_priors())>>
+    : std::true_type {};
+
+template <typename State>
+inline bool is_chance_node(const State& s) {
+  if constexpr (has_is_chance_node<State>::value) {
+    return (bool)s.is_chance_node();
+  } else {
+    return false;
+  }
+}
+
+template <typename State>
+inline auto get_chance_priors(const State& s) {
+  static_assert(has_chance_priors<State>::value,
+                "State has is_chance_node() but does not provide chance_priors()");
+  return s.chance_priors();
+}
+} // namespace detail
 
 // ---------------------------
 // MCTS result at root
@@ -237,7 +268,7 @@ struct SearchResult {
 };
 
 // ---------------------------
-// Original synchronous MCTS (unchanged)
+// Original synchronous MCTS (now with optional chance nodes)
 // ---------------------------
 template <class State,
           class Model,
@@ -259,9 +290,12 @@ public:
     root_ = std::make_unique<NodeT>(root_state);
     min_max_.reset();
 
+    // Expand root (chance nodes expand immediately; player nodes use model)
     expand_if_needed(*root_);
 
-    if (cfg_.dirichlet_epsilon > 0.0 && !root_->edges.empty()) {
+    // Root Dirichlet noise only makes sense at a player root.
+    if (!detail::is_chance_node(root_->state) &&
+        cfg_.dirichlet_epsilon > 0.0 && !root_->edges.empty()) {
       auto noise = sample_dirichlet(rng_, (int)root_->edges.size(), cfg_.dirichlet_alpha);
       for (size_t i = 0; i < root_->edges.size(); ++i) {
         double p = root_->edges[i].prior;
@@ -309,6 +343,22 @@ private:
   std::unique_ptr<NodeT> root_;
   MinMaxStats min_max_;
 
+  // Sample an edge according to priors (used for chance nodes)
+  EdgeT* select_chance_sample(NodeT& node) {
+    double sum = 0.0;
+    for (auto& e : node.edges) sum += std::max(0.0, e.prior);
+    if (sum <= 0.0) return nullptr;
+
+    std::uniform_real_distribution<double> dist(0.0, sum);
+    double u = dist(rng_);
+    double c = 0.0;
+    for (auto& e : node.edges) {
+      c += std::max(0.0, e.prior);
+      if (u <= c) return &e;
+    }
+    return &node.edges.back();
+  }
+
   void simulate(NodeT& root) {
     std::vector<PathStep> path;
     path.reserve(256);
@@ -328,6 +378,28 @@ private:
       }
 
       if (!node->expanded) {
+        // Chance nodes: expand from known distribution, DO NOT backup yet; keep going.
+        if (detail::is_chance_node(node->state)) {
+          expand_chance_node(*node);
+          // After expanding, immediately step to a sampled outcome.
+          EdgeT* e = select_chance_sample(*node);
+          if (!e) {
+            // No outcomes? treat as terminal-ish
+            BackupValue bv = BackupStrategy::make_leaf_value(0.0, nullptr, node->state);
+            backup(path, bv);
+            return;
+          }
+          if (!e->child) {
+            State child_state = node->state;
+            child_state.apply_move(e->move);
+            e->child = std::make_unique<NodeT>(child_state);
+          }
+          path.back().edge = e;
+          node = e->child.get();
+          continue;
+        }
+
+        // Player nodes: evaluate -> expand -> backup leaf value.
         EvalT eval = model_->evaluate(node->state);
         expand_with_eval(*node, eval);
         BackupValue bv = BackupStrategy::make_leaf_value(eval.value, &eval.payload, node->state);
@@ -335,7 +407,13 @@ private:
         return;
       }
 
-      EdgeT* best = select_puct(*node);
+      // Expanded node: choose edge
+      EdgeT* best = nullptr;
+      if (detail::is_chance_node(node->state)) {
+        best = select_chance_sample(*node);
+      } else {
+        best = select_puct(*node);
+      }
       assert(best && "Expanded node must have edges or be terminal");
 
       if (!best->child) {
@@ -368,8 +446,45 @@ private:
 
   void expand_if_needed(NodeT& node) {
     if (node.state.is_terminal() || node.expanded) return;
+
+    if (detail::is_chance_node(node.state)) {
+      expand_chance_node(node);
+      return;
+    }
+
     EvalT eval = model_->evaluate(node.state);
     expand_with_eval(node, eval);
+  }
+
+  void expand_chance_node(NodeT& node) {
+    if (node.expanded) return;
+
+    // Require chance_priors() if is_chance_node() exists.
+    auto pri = detail::get_chance_priors(node.state);
+    if (pri.empty()) {
+      node.expanded = true;
+      return;
+    }
+
+    // Normalize to be safe.
+    double sum = 0.0;
+    for (auto& kv : pri) sum += std::max(0.0, kv.second);
+    if (sum <= 0.0) {
+      double u = 1.0 / pri.size();
+      for (auto& kv : pri) kv.second = u;
+    } else {
+      for (auto& kv : pri) kv.second = std::max(0.0, kv.second) / sum;
+    }
+
+    node.edges.clear();
+    node.edges.reserve(pri.size());
+    for (auto& [m, p] : pri) {
+      EdgeT e;
+      e.move = m;
+      e.prior = p;
+      node.edges.push_back(std::move(e));
+    }
+    node.expanded = true;
   }
 
   void expand_with_eval(NodeT& node, const EvalT& eval) {
@@ -454,18 +569,8 @@ private:
 };
 
 // ---------------------------
-// NEW: Async/pumpable MCTS task
+// Async/pumpable MCTS task (now with optional chance nodes)
 // ---------------------------
-//
-// Async Model concept required by mcts_task:
-//
-// Model must provide:
-//   using Ticket = ...; // cheap movable handle
-//   Ticket submit(const State& s);
-//   bool   poll(const Ticket& t, Evaluation<Move,Payload>* out);
-//
-// poll must be safe to call from multiple CPU threads (read-only).
-//
 template <class State,
           class Model,
           class Payload = NoPayload,
@@ -488,7 +593,6 @@ public:
     min_max_.reset();
 
     if (root_->state.is_terminal()) {
-      // Terminal: nothing to expand; treat as done.
       completed_sims_ = cfg_.num_simulations;
     }
   }
@@ -504,13 +608,12 @@ public:
 
     bool did_any = false;
 
-    // 0) Ensure root expansion is submitted (like expand_if_needed in sync search)
-    did_any |= ensure_root_submitted();
+    // 0) Ensure root is expanded/submitted
+    did_any |= ensure_root_ready();
 
-    // 1) Reap any completed evals (including root expansion)
+    // 1) Reap completed evals
     did_any |= reap_ready();
 
-    // If root not expanded yet, we cannot run simulations.
     if (!root_->expanded && !root_->state.is_terminal()) {
       return did_any ? PumpStatus::Progress : PumpStatus::Waiting;
     }
@@ -522,7 +625,6 @@ public:
         did_any = true;
         continue;
       }
-      // Waiting: likely blocked by inflight leaves
       break;
     }
 
@@ -561,16 +663,30 @@ private:
   bool root_eval_submitted_ = false;
   Ticket root_ticket_{};
 
-  bool ensure_root_submitted() {
-    if (root_->state.is_terminal()) return false;
-    if (root_->expanded) return false;
-    if (root_eval_submitted_) return false;
+  // Chance sampling with inflight skip (avoid repeatedly picking blocked edges)
+  EdgeT* select_chance_sample_skip_inflight(NodeT& node) {
+    double sum = 0.0;
+    for (auto& e : node.edges) {
+      if (e.child && e.child->inflight && !e.child->expanded && !e.child->state.is_terminal()) continue;
+      sum += std::max(0.0, e.prior);
+    }
+    if (sum <= 0.0) return nullptr;
 
-    // Submit eval for root expansion (not counted as a simulation)
-    root_ticket_ = model_->submit(root_->state);
-    root_->inflight = true;
-    root_eval_submitted_ = true;
-    return true;
+    std::uniform_real_distribution<double> dist(0.0, sum);
+    double u = dist(rng_);
+    double c = 0.0;
+    for (auto& e : node.edges) {
+      if (e.child && e.child->inflight && !e.child->expanded && !e.child->state.is_terminal()) continue;
+      c += std::max(0.0, e.prior);
+      if (u <= c) return &e;
+    }
+    // Fallback: return last non-skipped edge
+    for (auto it = node.edges.rbegin(); it != node.edges.rend(); ++it) {
+      auto& e = *it;
+      if (e.child && e.child->inflight && !e.child->expanded && !e.child->state.is_terminal()) continue;
+      return &e;
+    }
+    return nullptr;
   }
 
   // selection that skips edges whose child is an inflight, unexpanded leaf
@@ -591,8 +707,25 @@ private:
     return best;
   }
 
+  bool ensure_root_ready() {
+    if (root_->state.is_terminal()) return false;
+    if (root_->expanded) return false;
+
+    // Chance root: expand immediately (no model).
+    if (detail::is_chance_node(root_->state)) {
+      expand_chance_node(*root_);
+      return true;
+    }
+
+    if (root_eval_submitted_) return false;
+
+    root_ticket_ = model_->submit(root_->state);
+    root_->inflight = true;
+    root_eval_submitted_ = true;
+    return true;
+  }
+
   SimStepStatus simulate_once() {
-    // Optional throttle: avoid unbounded pending queue
     if (max_inflight_ > 0 && (int)pending_.size() >= max_inflight_) {
       return SimStepStatus::Waiting;
     }
@@ -615,9 +748,24 @@ private:
       }
 
       if (!node->expanded) {
+        // Chance node: expand and keep going (no eval, no backup yet)
+        if (detail::is_chance_node(node->state)) {
+          expand_chance_node(*node);
+          EdgeT* e = select_chance_sample_skip_inflight(*node);
+          if (!e) return SimStepStatus::Waiting;
+
+          if (!e->child) {
+            State child_state = node->state;
+            child_state.apply_move(e->move);
+            e->child = std::make_unique<NodeT>(child_state);
+          }
+          path.back().edge = e;
+          node = e->child.get();
+          continue;
+        }
+
         if (node->inflight) return SimStepStatus::Waiting;
 
-        // Submit leaf eval and return immediately
         Ticket t = model_->submit(node->state);
         node->inflight = true;
 
@@ -625,7 +773,12 @@ private:
         return SimStepStatus::Submitted;
       }
 
-      EdgeT* best = select_puct_skip_inflight(*node);
+      EdgeT* best = nullptr;
+      if (detail::is_chance_node(node->state)) {
+        best = select_chance_sample_skip_inflight(*node);
+      } else {
+        best = select_puct_skip_inflight(*node);
+      }
       if (!best) return SimStepStatus::Waiting;
 
       if (!best->child) {
@@ -642,15 +795,17 @@ private:
   bool reap_ready() {
     bool did = false;
 
-    // First: check root expansion ticket
+    // Root expansion (player root only)
     if (root_eval_submitted_ && !root_->expanded) {
       EvalT eval;
       if (model_->poll(root_ticket_, &eval)) {
         root_->inflight = false;
         expand_with_eval(*root_, eval);
 
-        // Apply Dirichlet noise at root (like sync search)
-        if (!root_noise_applied_ && cfg_.dirichlet_epsilon > 0.0 && !root_->edges.empty()) {
+        // Root Dirichlet noise only for player root
+        if (!root_noise_applied_ &&
+            cfg_.dirichlet_epsilon > 0.0 && !root_->edges.empty() &&
+            !detail::is_chance_node(root_->state)) {
           auto noise = sample_dirichlet(rng_, (int)root_->edges.size(), cfg_.dirichlet_alpha);
           for (size_t i = 0; i < root_->edges.size(); ++i) {
             double p = root_->edges[i].prior;
@@ -687,6 +842,35 @@ private:
     }
 
     return did;
+  }
+
+  void expand_chance_node(NodeT& node) {
+    if (node.expanded) return;
+
+    auto pri = detail::get_chance_priors(node.state);
+    if (pri.empty()) {
+      node.expanded = true;
+      return;
+    }
+
+    double sum = 0.0;
+    for (auto& kv : pri) sum += std::max(0.0, kv.second);
+    if (sum <= 0.0) {
+      double u = 1.0 / pri.size();
+      for (auto& kv : pri) kv.second = u;
+    } else {
+      for (auto& kv : pri) kv.second = std::max(0.0, kv.second) / sum;
+    }
+
+    node.edges.clear();
+    node.edges.reserve(pri.size());
+    for (auto& [m, p] : pri) {
+      EdgeT e;
+      e.move = m;
+      e.prior = p;
+      node.edges.push_back(std::move(e));
+    }
+    node.expanded = true;
   }
 
   void expand_with_eval(NodeT& node, const EvalT& eval) {

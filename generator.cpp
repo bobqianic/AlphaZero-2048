@@ -26,35 +26,95 @@ static constexpr double kDiscount = 0.999;
 // 2048 state for MCTS
 // ---------------------------
 struct S2048 {
-  using Move = env2048::Action;
-  using Player = int; // single-agent
+  using Player = int;
+
+  double gamma_from_parent = kDiscount;
+
+  struct Move {
+    enum Kind : std::uint8_t { Act = 0, Spawn = 1 } k;
+    std::uint8_t v; // Act: 0..3, Spawn: 0..31
+
+    bool operator==(const Move& o) const { return k == o.k && v == o.v; }
+  };
 
   env2048::Env env;
-  env2048::RNG rng;
 
+  // Reward from parent transition (for backup)
   double reward_from_parent_raw = 0.0;
 
+  enum Phase : std::uint8_t { PlayerPhase = 0, ChancePhase = 1 } phase = PlayerPhase;
+
+  std::array<env2048::ChanceOutcome, 32> outs{};
+  std::size_t out_n = 0;
+
   S2048() = default;
-  explicit S2048(env2048::Env::Board b, std::uint64_t seed) : env(b), rng(seed) {}
+  explicit S2048(env2048::Env::Board b) : env(b), phase(PlayerPhase) {}
 
   Player current_player() const { return 0; }
-  bool is_terminal() const { return env.is_terminal(); }
+
+  bool is_chance_node() const { return phase == ChancePhase; }
+
+  bool is_terminal() const {
+    // Only meaningful at player decision points (after a spawn)
+    return phase == PlayerPhase && env.is_terminal();
+  }
+
   double terminal_value(Player /*perspective*/) const { return 0.0; }
 
   std::vector<Move> legal_moves() const {
     std::vector<Move> m;
-    const std::uint8_t mask = env.legal_actions_mask();
-    for (int a = 0; a < env2048::kNumActions; ++a) {
-      if (mask & (1u << a)) m.push_back(static_cast<Move>(a));
+    if (phase == PlayerPhase) {
+      const std::uint8_t mask = env.legal_actions_mask();
+      for (int a = 0; a < env2048::kNumActions; ++a) {
+        if (mask & (1u << a)) m.push_back(Move{Move::Act, (std::uint8_t)a});
+      }
+    } else {
+      for (std::size_t i = 0; i < out_n; ++i) {
+        m.push_back(Move{Move::Spawn, (std::uint8_t)i});
+      }
     }
     return m;
   }
 
+  // Priors for chance node expansion (probabilities of spawn outcomes)
+  std::vector<std::pair<Move, double>> chance_priors() const {
+    std::vector<std::pair<Move, double>> p;
+    p.reserve(out_n);
+    for (std::size_t i = 0; i < out_n; ++i) {
+      p.push_back({Move{Move::Spawn, (std::uint8_t)i}, (double)outs[i].prob});
+    }
+    return p;
+  }
+
   void apply_move(const Move& mv) {
-    auto sr = env.step(mv, rng);
-    reward_from_parent_raw = static_cast<double>(sr.reward);
+    if (phase == PlayerPhase) {
+      // Deterministic move only (NO spawn here)
+      auto r = env.move((env2048::Action)mv.v);
+      reward_from_parent_raw = (double)r.reward;
+
+      // legal_moves() should guarantee moved==true, but be safe
+      if (!r.moved) {
+        reward_from_parent_raw = 0.0;
+        return;
+      }
+
+      gamma_from_parent = kDiscount;
+
+      // Enumerate stochastic outcomes and switch to chance node
+      out_n = env.enumerate_spawns(outs);
+      phase = ChancePhase;
+      return;
+    } else {
+      // Chance phase: apply chosen spawn outcome
+      env.set_board(outs[mv.v].board);
+      reward_from_parent_raw = 0.0;
+      gamma_from_parent = 1.0;
+      phase = PlayerPhase;
+      return;
+    }
   }
 };
+
 
 // ---------------------------
 // Backup strategy: discounted return (single-agent).
@@ -71,10 +131,11 @@ struct DiscountedReturnBackup {
   }
 
   static BackupValue move_to_parent(const BackupValue& v_child,
-                                   const State& /*parent_state*/,
+                                   const State& parent_state,
                                    const State& child_state) {
     const double r = child_state.reward_from_parent_raw;
-    return r + kDiscount * v_child;
+    const double gamma = child_state.gamma_from_parent;
+    return r + gamma * v_child;
   }
 
   static void update_node(agmcts::Node<State, DiscountedReturnBackup>& node,
@@ -84,8 +145,13 @@ struct DiscountedReturnBackup {
 
   static void update_edge(agmcts::Edge<State, DiscountedReturnBackup>& edge,
                           const BackupValue& v_child) {
-    const double r = edge.child ? edge.child->state.reward_from_parent_raw : 0.0;
-    const double v_edge = r + kDiscount * v_child;
+    if (!edge.child) return;
+    const auto& child_state = edge.child->state;
+
+    const double r = child_state.reward_from_parent_raw;
+    const double gamma = child_state.gamma_from_parent;
+
+    const double v_edge = r + gamma * v_child;
 
     edge.N += 1;
     edge.W += v_edge;
@@ -409,16 +475,16 @@ struct TorchAsyncMCTSModel {
     return be->submit(s.env.board());
   }
 
-  bool poll(const Ticket& t, agmcts::Evaluation<env2048::Action, agmcts::NoPayload>* out) {
+  bool poll(const Ticket& t, agmcts::Evaluation<S2048::Move, agmcts::NoPayload>* out) {
     if (!t->ready.load(std::memory_order_acquire)) return false;
 
     const EvalOut& o = t->out;
     out->value = o.value;
     out->policy = {
-      {env2048::Action::Up,    o.policy[0]},
-      {env2048::Action::Right, o.policy[1]},
-      {env2048::Action::Down,  o.policy[2]},
-      {env2048::Action::Left,  o.policy[3]},
+      {S2048::Move{S2048::Move::Act, 0}, o.policy[0]}, // Up
+      {S2048::Move{S2048::Move::Act, 1}, o.policy[1]}, // Right
+      {S2048::Move{S2048::Move::Act, 2}, o.policy[2]}, // Down
+      {S2048::Move{S2048::Move::Act, 3}, o.policy[3]}, // Left
     };
     return true;
   }
@@ -609,7 +675,7 @@ void Generator::generate_into(ReplayBuffer& replay, std::uint64_t train_step) {
 
       const std::uint64_t root_seed = splitmix64(ep->episode_seed ^ (uint64_t)board ^ (0xA5A5A5A5A5A5A5A5ull + ep->steps.size()));
 
-      S2048 root(board, root_seed);
+      S2048 root(board);
       root.reward_from_parent_raw = 0.0;
 
       search = std::make_unique<SearchTask>(cfg_step, model, root, max_inflight_per_task);
@@ -634,15 +700,20 @@ void Generator::generate_into(ReplayBuffer& replay, std::uint64_t train_step) {
 
       std::array<float,4> pi = {0,0,0,0};
 
+      // Root should be a PLAYER node => root moves should be Act(0..3)
       if (temp_run <= 1e-12) {
         int best_a = 0, best_v = -1;
         for (const auto& e : res.root_entries) {
-          if (e.visits > best_v) { best_v = e.visits; best_a = (int)e.move; }
+          if (e.move.k != S2048::Move::Act) continue; // defensive
+          if (e.visits > best_v) { best_v = e.visits; best_a = (int)e.move.v; }
         }
         pi[best_a] = 1.0f;
       } else {
         auto dist = res.visit_distribution(temp_run);
-        for (auto& [mv, p] : dist) pi[(int)mv] = (float)p;
+        for (auto& [mv, p] : dist) {
+          if (mv.k != S2048::Move::Act) continue;     // defensive
+          pi[mv.v] = (float)p;
+        }
       }
 
       env2048::Action action;
@@ -657,9 +728,12 @@ void Generator::generate_into(ReplayBuffer& replay, std::uint64_t train_step) {
       // visit-weighted Q at root
       double root_value_raw = 0.0;
       int total_visits = 0;
-      for (const auto& e : res.root_entries) total_visits += e.visits;
+      for (const auto& e : res.root_entries) {
+        if (e.move.k == S2048::Move::Act) total_visits += e.visits;
+      }
       if (total_visits > 0) {
         for (const auto& e : res.root_entries) {
+          if (e.move.k != S2048::Move::Act) continue;
           root_value_raw += (double(e.visits) / double(total_visits)) * e.q;
         }
       }
