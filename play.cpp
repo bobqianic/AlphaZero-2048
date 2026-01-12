@@ -1,29 +1,12 @@
-//
-// Created by qianp on 29/12/2025.
-//
-
 // play.cpp
 //
 // Minimal “play a game” driver built to mirror generator.cpp’s MCTS+batched-eval flow,
 // but for a single episode with board printing.
 //
-// ----- API you can call from main.cpp (forward-declare or put in a play.h) -----
+// + Added play_many(): play multiple games simultaneously sharing one BatchedEvaluator.
 //
-// namespace play2048 {
-//   struct PlayConfig;
-//   struct PlayResult;
-//   void print_board(env2048::Env::Board b, std::ostream& os);
-//   PlayResult play(rl2048::Net net, torch::Device device, const PlayConfig& cfg, std::ostream& os);
-// }
-//
-// ------------------------------------------------------------------------------
 
 #include "play.h"
-#include "util/core/env2048.h"
-#include "util/core/mcts.h"
-#include "model.h"
-#include "util/logger.h"
-#include "util/cuda/encode2048.h"
 
 #include <algorithm>
 #include <array>
@@ -33,495 +16,14 @@
 #include <cstdint>
 #include <deque>
 #include <iomanip>
-#include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include <ATen/cuda/CUDAEvent.h>
-#include <ATen/autocast_mode.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-
 namespace play2048 {
-
-static constexpr double kDiscount = 0.999;
-
-// ---------------------------
-// 2048 state for MCTS
-// ---------------------------
-struct S2048 {
-  using Player = int;
-
-  double gamma_from_parent = kDiscount;
-
-  struct Move {
-    enum Kind : std::uint8_t { Act = 0, Spawn = 1 } k;
-    std::uint8_t v; // Act: 0..3, Spawn: 0..31
-
-    bool operator==(const Move& o) const { return k == o.k && v == o.v; }
-  };
-
-  env2048::Env env;
-
-  // Reward from parent transition (for backup)
-  double reward_from_parent_raw = 0.0;
-
-  enum Phase : std::uint8_t { PlayerPhase = 0, ChancePhase = 1 } phase = PlayerPhase;
-
-  std::array<env2048::ChanceOutcome, 32> outs{};
-  std::size_t out_n = 0;
-
-  S2048() = default;
-  explicit S2048(env2048::Env::Board b) : env(b), phase(PlayerPhase) {}
-
-  Player current_player() const { return 0; }
-
-  bool is_chance_node() const { return phase == ChancePhase; }
-
-  bool is_terminal() const {
-    // Only meaningful at player decision points (after a spawn)
-    return phase == PlayerPhase && env.is_terminal();
-  }
-
-  double terminal_value(Player /*perspective*/) const { return 0.0; }
-
-  std::vector<Move> legal_moves() const {
-    std::vector<Move> m;
-    if (phase == PlayerPhase) {
-      const std::uint8_t mask = env.legal_actions_mask();
-      for (int a = 0; a < env2048::kNumActions; ++a) {
-        if (mask & (1u << a)) m.push_back(Move{Move::Act, (std::uint8_t)a});
-      }
-    } else {
-      for (std::size_t i = 0; i < out_n; ++i) {
-        m.push_back(Move{Move::Spawn, (std::uint8_t)i});
-      }
-    }
-    return m;
-  }
-
-  // Priors for chance node expansion (probabilities of spawn outcomes)
-  std::vector<std::pair<Move, double>> chance_priors() const {
-    std::vector<std::pair<Move, double>> p;
-    p.reserve(out_n);
-    for (std::size_t i = 0; i < out_n; ++i) {
-      p.push_back({Move{Move::Spawn, (std::uint8_t)i}, (double)outs[i].prob});
-    }
-    return p;
-  }
-
-  void apply_move(const Move& mv) {
-    if (phase == PlayerPhase) {
-      // Deterministic move only (NO spawn here)
-      auto r = env.move((env2048::Action)mv.v);
-      reward_from_parent_raw = (double)r.reward;
-
-      // legal_moves() should guarantee moved==true, but be safe
-      if (!r.moved) {
-        reward_from_parent_raw = 0.0;
-        return;
-      }
-
-      gamma_from_parent = kDiscount;
-
-      // Enumerate stochastic outcomes and switch to chance node
-      out_n = env.enumerate_spawns(outs);
-      phase = ChancePhase;
-      return;
-    } else {
-      // Chance phase: apply chosen spawn outcome
-      env.set_board(outs[mv.v].board);
-      reward_from_parent_raw = 0.0;
-      gamma_from_parent = 1.0;
-      phase = PlayerPhase;
-      return;
-    }
-  }
-};
-
-// ---------------------------
-// Backup strategy: discounted return (single-agent).
-// ---------------------------
-  template <class State, class Payload>
-  struct DiscountedReturnBackup {
-    using EvalPayload = Payload;
-    using BackupValue = double;
-
-    static BackupValue make_leaf_value(double leaf_value,
-                                       const EvalPayload* /*payload*/,
-                                       const State& /*leaf_state*/) {
-      return leaf_value;
-    }
-
-    static BackupValue move_to_parent(const BackupValue& v_child,
-                                     const State& parent_state,
-                                     const State& child_state) {
-      const double r = child_state.reward_from_parent_raw;
-      const double gamma = child_state.gamma_from_parent;
-      return r + gamma * v_child;
-    }
-
-    static void update_node(agmcts::Node<State, DiscountedReturnBackup>& node,
-                            const BackupValue& /*v*/) {
-      node.N += 1;
-    }
-
-    static void update_edge(agmcts::Edge<State, DiscountedReturnBackup>& edge,
-                            const BackupValue& v_child) {
-      if (!edge.child) return;
-      const auto& child_state = edge.child->state;
-
-      const double r = child_state.reward_from_parent_raw;
-      const double gamma = child_state.gamma_from_parent;
-
-      const double v_edge = r + gamma * v_child;
-
-      edge.N += 1;
-      edge.W += v_edge;
-      edge.Q = edge.W / std::max(1, edge.N);
-    }
-  };
-
-// ---------------------------
-// Async Batched Evaluator (submit + poll) — same idea as generator.cpp
-// ---------------------------
-struct EvalOut {
-  std::array<double,4> policy;
-  double value;
-};
-
-struct EvalHandle {
-  env2048::Env::Board board{};
-  EvalOut out{};
-  std::atomic<bool> ready{false};
-};
-
-struct AutocastGuard {
-  at::DeviceType device_type;
-  bool prev_enabled;
-  at::ScalarType prev_dtype;
-
-  AutocastGuard(at::DeviceType dt, at::ScalarType dtype, bool enabled = true)
-      : device_type(dt),
-        prev_enabled(at::autocast::is_autocast_enabled(dt)),
-        prev_dtype(at::autocast::get_autocast_dtype(dt)) {
-    at::autocast::set_autocast_enabled(dt, enabled);
-    at::autocast::set_autocast_dtype(dt, dtype);
-  }
-
-  ~AutocastGuard() {
-    at::autocast::set_autocast_dtype(device_type, prev_dtype);
-    at::autocast::set_autocast_enabled(device_type, prev_enabled);
-  }
-};
-
-class BatchedEvaluator {
-public:
-  BatchedEvaluator(rl2048::Net net,
-                   torch::Device device,
-                   int max_batch,
-                   int max_wait_us)
-      : net_(std::move(net)),
-        device_(device),
-        max_batch_(std::max(1, max_batch)),
-        max_wait_us_(std::max(1, max_wait_us)) {
-
-    net_->to(device_);
-    net_->eval();
-
-    support_ = torch::arange(
-                 0, rl2048::kSupportMax + 1,
-                 torch::TensorOptions().dtype(torch::kFloat32).device(device_))
-                 .view({1, -1});
-
-    init_slots();
-    worker_ = std::thread([this] { loop(); });
-  }
-
-  ~BatchedEvaluator() {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      stop_ = true;
-    }
-    cv_.notify_all();
-    if (worker_.joinable()) worker_.join();
-  }
-
-  std::shared_ptr<EvalHandle> submit(env2048::Env::Board b) {
-    auto h = std::make_shared<EvalHandle>();
-    h->board = b;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      q_.push_back(h);
-    }
-    cv_.notify_one();
-    return h;
-  }
-
-  uint64_t epoch() const { return epoch_.load(std::memory_order_relaxed); }
-
-  void wait_for_epoch_change(uint64_t last_epoch, int timeout_us) {
-    std::unique_lock<std::mutex> lk(epoch_mu_);
-    epoch_cv_.wait_for(
-      lk,
-      std::chrono::microseconds(timeout_us),
-      [&] { return epoch_.load(std::memory_order_relaxed) != last_epoch; }
-    );
-  }
-
-private:
-  rl2048::Net net_;
-  torch::Device device_;
-  int max_batch_;
-  int max_wait_us_;
-
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<std::shared_ptr<EvalHandle>> q_;
-  bool stop_ = false;
-  std::thread worker_;
-
-  torch::Tensor support_;
-
-  std::atomic<uint64_t> epoch_{0};
-  std::mutex epoch_mu_;
-  std::condition_variable epoch_cv_;
-
-  struct Slot {
-    torch::Tensor boards_pinned; // [maxB] pinned CPU int64
-    torch::Tensor boards_dev;    // [maxB] GPU int64
-
-    torch::Tensor xb_dev;        // [maxB, obs] GPU float32
-    torch::Tensor p_pinned;      // [maxB, 4] pinned CPU float
-    torch::Tensor v_pinned;      // [maxB] pinned CPU float
-
-    std::optional<at::cuda::CUDAStream> stream;
-    at::cuda::CUDAEvent done;
-
-    bool in_use = false;
-    int B = 0;
-    std::vector<std::shared_ptr<EvalHandle>> batch;
-  };
-
-  static constexpr int kSlots = 4; // play-mode: fewer slots is fine
-  std::array<Slot, kSlots> slots_{};
-
-  void init_slots() {
-    auto pinned_f32 = torch::TensorOptions()
-                    .dtype(torch::kFloat32)
-                    .device(torch::kCPU)
-                    .pinned_memory(true);
-
-    auto pinned_i64 = torch::TensorOptions()
-                        .dtype(torch::kInt64)
-                        .device(torch::kCPU)
-                        .pinned_memory(true);
-
-    auto dev_i64 = torch::TensorOptions()
-                     .dtype(torch::kInt64)
-                     .device(device_);
-
-    auto dev_f32 = torch::TensorOptions()
-                     .dtype(torch::kFloat32)
-                     .device(device_);
-
-    for (auto& s : slots_) {
-      s.boards_pinned = torch::empty({max_batch_}, pinned_i64);
-      s.boards_dev    = torch::empty({max_batch_}, dev_i64);
-
-      s.xb_dev        = torch::empty({max_batch_, (int64_t)rl2048::kObsDim}, dev_f32);
-
-      s.p_pinned      = torch::empty({max_batch_, 4}, pinned_f32);
-      s.v_pinned      = torch::empty({max_batch_}, pinned_f32);
-
-      s.stream = at::cuda::getStreamFromPool(false, device_.index());
-    }
-  }
-
-  std::vector<std::shared_ptr<EvalHandle>> take_batch_from_queue() {
-    using clock = std::chrono::steady_clock;
-
-    std::vector<std::shared_ptr<EvalHandle>> batch;
-    batch.reserve((size_t)max_batch_);
-
-    auto drain = [&] {
-      while (!q_.empty() && (int)batch.size() < max_batch_) {
-        batch.emplace_back(std::move(q_.front()));
-        q_.pop_front();
-      }
-    };
-
-    auto any_in_flight = [&] {
-      for (auto& s : slots_) if (s.in_use) return true;
-      return false;
-    };
-
-    std::unique_lock<std::mutex> lk(mu_);
-
-    if (q_.empty() && !stop_) {
-      if (any_in_flight()) {
-        cv_.wait_for(lk, std::chrono::microseconds(200),
-                     [&] { return stop_ || !q_.empty(); });
-      } else {
-        cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
-      }
-    }
-
-    if (stop_ && q_.empty()) return batch;
-    if (q_.empty()) return batch;
-
-    drain();
-
-    const auto deadline = clock::now() + std::chrono::microseconds(max_wait_us_);
-
-    while (!stop_ && (int)batch.size() < max_batch_) {
-      if (clock::now() >= deadline) break;
-
-      if (q_.empty()) {
-        if (!cv_.wait_until(lk, deadline, [&] { return stop_ || !q_.empty(); })) break;
-      }
-      drain();
-    }
-
-    return batch;
-  }
-
-  void loop() {
-    torch::InferenceMode im;
-    at::cuda::CUDAGuard device_guard(device_.index());
-
-    while (true) {
-      // 1) Retire completed slots
-      for (auto& s : slots_) {
-        if (!s.in_use || !s.done.query()) continue;
-
-        auto p_view = s.p_pinned.narrow(0, 0, s.B);
-        auto v_view = s.v_pinned.narrow(0, 0, s.B);
-
-        const float* pptr = p_view.data_ptr<float>();
-        const float* vptr = v_view.data_ptr<float>();
-
-        for (int i = 0; i < s.B; ++i) {
-          auto& h = s.batch[i];
-          for (int a = 0; a < 4; ++a) h->out.policy[a] = pptr[i * 4 + a];
-          h->out.value = (double)vptr[i];
-          h->ready.store(true, std::memory_order_release);
-        }
-
-        s.batch.clear();
-        s.in_use = false;
-
-        epoch_.fetch_add(1, std::memory_order_relaxed);
-        epoch_cv_.notify_all();
-      }
-
-      // 2) Find a free slot
-      Slot* slot = nullptr;
-      for (auto& s : slots_) {
-        if (!s.in_use) { slot = &s; break; }
-      }
-
-      if (!slot) {
-        for (auto& s : slots_) {
-          if (s.in_use) { s.done.synchronize(); break; }
-        }
-        continue;
-      }
-
-      // 3) Build batch
-      auto batch = take_batch_from_queue();
-      if (batch.empty()) {
-        if (stop_) return;
-        continue;
-      }
-
-      slot->B = (int)batch.size();
-      slot->batch = std::move(batch);
-      slot->in_use = true;
-
-      auto b_cpu = slot->boards_pinned.narrow(0, 0, slot->B);
-      int64_t* bptr = b_cpu.data_ptr<int64_t>();
-      for (int i = 0; i < slot->B; ++i) {
-        bptr[i] = (int64_t)slot->batch[i]->board; // preserve bit pattern
-      }
-
-      // 4) Launch GPU work on this slot’s stream
-      {
-        c10::cuda::CUDAStreamGuard sg(slot->stream.value().unwrap());
-
-        auto b_dev  = slot->boards_dev.narrow(0, 0, slot->B);
-        auto xb_dev = slot->xb_dev.narrow(0, 0, slot->B);
-
-        b_dev.copy_(b_cpu, /*non_blocking=*/true);
-
-        // provided elsewhere in your project
-        encode2048_onehot31_out_cuda(b_dev, xb_dev);
-
-        torch::Tensor pl, vl, rl;
-        {
-          AutocastGuard amp(at::kCUDA, at::kBFloat16, true);
-          std::tie(pl, vl, rl) = net_->forward(xb_dev);
-        }
-
-        auto p_dev = torch::softmax(pl.to(torch::kFloat32), 1);
-        auto v_dev = rl2048::decode_value_raw(vl.to(torch::kFloat32), support_, rl2048::kEpsTransform);
-
-        auto p_cpu = slot->p_pinned.narrow(0, 0, slot->B);
-        auto v_cpu = slot->v_pinned.narrow(0, 0, slot->B);
-
-        p_cpu.copy_(p_dev, /*non_blocking=*/true);
-        v_cpu.copy_(v_dev, /*non_blocking=*/true);
-
-        slot->done.record();
-      }
-    }
-  }
-};
-
-// ---------------------------
-// Async model wrapper for mcts_task
-// ---------------------------
-struct TorchAsyncMCTSModel {
-  using Ticket = std::shared_ptr<EvalHandle>;
-  std::shared_ptr<BatchedEvaluator> be;
-
-  explicit TorchAsyncMCTSModel(std::shared_ptr<BatchedEvaluator> eval) : be(std::move(eval)) {
-    if (!be) throw std::runtime_error("TorchAsyncMCTSModel: BatchedEvaluator is null");
-  }
-
-  Ticket submit(const S2048& s) {
-    return be->submit(s.env.board());
-  }
-
-  bool poll(const Ticket& t, agmcts::Evaluation<S2048::Move, agmcts::NoPayload>* out) {
-    if (!t->ready.load(std::memory_order_acquire)) return false;
-
-    const EvalOut& o = t->out;
-    out->value = o.value;
-    out->policy = {
-      {S2048::Move{S2048::Move::Act, 0}, o.policy[0]}, // Up
-      {S2048::Move{S2048::Move::Act, 1}, o.policy[1]}, // Right
-      {S2048::Move{S2048::Move::Act, 2}, o.policy[2]}, // Down
-      {S2048::Move{S2048::Move::Act, 3}, o.policy[3]}, // Left
-    };
-    return true;
-  }
-};
-
-// ---------------------------
-// Helpers (seeds, sampling, printing)
-// ---------------------------
-static inline std::uint64_t splitmix64(std::uint64_t x) {
-  x += 0x9E3779B97F4A7C15ull;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  return x ^ (x >> 31);
-}
 
 static const char* action_name(env2048::Action a) {
   switch (a) {
@@ -531,18 +33,6 @@ static const char* action_name(env2048::Action a) {
     case env2048::Action::Left:  return "Left";
     default: return "?";
   }
-}
-
-static env2048::Action sample_action(const std::array<float,4>& probs, env2048::RNG& rng) {
-  const double u = double(rng.next_u32_raw()) / 4294967296.0;
-  double c = 0.0;
-  for (int a = 0; a < 4; ++a) {
-    c += probs[a];
-    if (u <= c) return static_cast<env2048::Action>(a);
-  }
-  int best = 0;
-  for (int a = 1; a < 4; ++a) if (probs[a] > probs[best]) best = a;
-  return static_cast<env2048::Action>(best);
 }
 
 void print_board(env2048::Env::Board b, std::ostream& os) {
@@ -576,6 +66,7 @@ static env2048::Action select_action_mcts(
   cfg.dirichlet_epsilon = pcfg.dirichlet_epsilon;
   cfg.temperature = pcfg.temperature;
   cfg.seed = splitmix64(pcfg.seed ^ episode_seed ^ (0x9E3779B97F4A7C15ull + step_index));
+  cfg.use_afterstate_value = pcfg.afterstate;
 
   using Backup = DiscountedReturnBackup<S2048, agmcts::NoPayload>;
   using SearchTask = agmcts::mcts_task<S2048, TorchAsyncMCTSModel, agmcts::NoPayload, Backup>;
@@ -583,6 +74,7 @@ static env2048::Action select_action_mcts(
   const auto board = env.board();
   const std::uint64_t root_seed =
       splitmix64(episode_seed ^ (std::uint64_t)board ^ (0xA5A5A5A5A5A5A5A5ull + step_index));
+  (void)root_seed;
 
   S2048 root(board);
   root.reward_from_parent_raw = 0.0;
@@ -627,7 +119,7 @@ static env2048::Action select_action_mcts(
 }
 
 // ---------------------------
-// Main play() API
+// Main play() API (single game)
 // ---------------------------
 PlayResult play(rl2048::Net net, torch::Device device, const PlayConfig& cfg, std::ostream& os) {
   if (!net) throw std::runtime_error("play2048::play: net is null");
@@ -666,7 +158,6 @@ PlayResult play(rl2048::Net net, torch::Device device, const PlayConfig& cfg, st
 
     const auto action = select_action_mcts(env, episode_seed, step, sample_rng, amodel, be, cfg);
 
-    const auto before = env.board();
     auto sr = env.step(action, game_rng);
 
     // (Shouldn’t happen often; MCTS should avoid illegal moves, but be safe)
@@ -690,9 +181,6 @@ PlayResult play(rl2048::Net net, torch::Device device, const PlayConfig& cfg, st
          << "  score=" << env.score()
          << "  max_tile=" << pr.max_tile
          << "\n";
-      // If you want to see packed board values too:
-      // os << "before=0x" << std::hex << before << " after=0x" << env.board() << std::dec << "\n";
-      (void)before;
       print_board(env.board(), os);
     }
   }
@@ -704,6 +192,416 @@ PlayResult play(rl2048::Net net, torch::Device device, const PlayConfig& cfg, st
      << " max_tile=" << pr.max_tile
      << "\n";
   return pr;
+}
+
+// ============================================================================
+// play_many() — multi-game concurrent play sharing the same evaluator
+// Mirrors generator.cpp’s WorkQueue + worker pool pattern.
+// ============================================================================
+
+namespace {
+
+class WorkQueue {
+public:
+  void push(std::unique_ptr<struct WorkItem> w) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (stop_) return;
+      q_.push_back(std::move(w));
+    }
+    cv_.notify_one();
+  }
+
+  std::unique_ptr<struct WorkItem> pop() {
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [&]{ return stop_ || !q_.empty(); });
+    if (q_.empty()) return nullptr;
+    auto w = std::move(q_.front());
+    q_.pop_front();
+    return w;
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+  }
+
+private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::unique_ptr<struct WorkItem>> q_;
+  bool stop_ = false;
+};
+
+enum class WorkOutcome { RequeueProgress, RequeueWaiting, Finished };
+
+struct WorkItem {
+  virtual ~WorkItem() = default;
+  virtual WorkOutcome pump(int sim_budget) = 0;
+};
+
+struct EpisodeCtx {
+  int id = 0;
+  std::uint64_t ep_seed = 0;
+  std::uint64_t episode_seed = 0;
+
+  env2048::RNG game_rng{0};
+  env2048::RNG sample_rng{0};
+  env2048::Env env;
+
+  PlayResult pr{};
+};
+
+} // namespace
+
+MultiPlayResult play_many(rl2048::Net net, torch::Device device,
+                          const MultiPlayConfig& mcfg, std::ostream& os) {
+  if (!net) throw std::runtime_error("play2048::play_many: net is null");
+
+  MultiPlayResult out;
+  if (mcfg.games <= 0) return out;
+
+  net->to(device);
+  net->eval();
+
+  // Shared evaluator across ALL games
+  auto be = std::make_shared<BatchedEvaluator>(
+      net, device,
+      /*max_batch=*/mcfg.game.eval_max_batch,
+      /*max_wait_us=*/mcfg.game.eval_max_wait_us);
+
+  TorchAsyncMCTSModel amodel(be);
+
+  using Backup = DiscountedReturnBackup<S2048, agmcts::NoPayload>;
+  using SearchTask = agmcts::mcts_task<S2048, TorchAsyncMCTSModel, agmcts::NoPayload, Backup>;
+
+  // Base MCTS config (per-step seed overridden)
+  agmcts::MCTSConfig cfg_base;
+  cfg_base.num_simulations = mcfg.game.sims;
+  cfg_base.cpuct = mcfg.game.cpuct;
+  cfg_base.dirichlet_alpha = mcfg.game.dirichlet_alpha;
+  cfg_base.dirichlet_epsilon = mcfg.game.dirichlet_epsilon;
+  cfg_base.temperature = mcfg.game.temperature;
+  cfg_base.seed = 0xC0FFEEULL ^ mcfg.game.seed;
+  cfg_base.use_afterstate_value = mcfg.game.afterstate;
+
+  const int max_inflight_per_task =
+      std::max(32, mcfg.game.max_inflight_per_task);
+
+  WorkQueue wq;
+  std::atomic<int> done_games{0};
+
+  out.results.resize((size_t)mcfg.games);
+
+  std::mutex os_mu;
+
+  struct StepSearchWork final : WorkItem {
+    WorkQueue* wq = nullptr;
+    TorchAsyncMCTSModel* model = nullptr;
+    std::shared_ptr<BatchedEvaluator> be;
+
+    agmcts::MCTSConfig cfg_base;
+    int max_inflight_per_task = 0;
+
+    const MultiPlayConfig* mcfg = nullptr;
+
+    std::atomic<int>* done_games = nullptr;
+    int total_games = 0;
+
+    std::shared_ptr<EpisodeCtx> ep;
+    std::vector<PlayResult>* results = nullptr;
+
+    std::mutex* os_mu = nullptr;
+    std::ostream* os = nullptr;
+
+    std::unique_ptr<SearchTask> search;
+
+    StepSearchWork(WorkQueue* wq_,
+                   TorchAsyncMCTSModel* model_,
+                   std::shared_ptr<BatchedEvaluator> be_,
+                   const agmcts::MCTSConfig& cfg_base_,
+                   int max_inflight_per_task_,
+                   const MultiPlayConfig* mcfg_,
+                   std::atomic<int>* done_games_,
+                   int total_games_,
+                   std::shared_ptr<EpisodeCtx> ep_,
+                   std::vector<PlayResult>* results_,
+                   std::mutex* os_mu_,
+                   std::ostream* os_)
+      : wq(wq_), model(model_), be(std::move(be_)),
+        cfg_base(cfg_base_), max_inflight_per_task(max_inflight_per_task_),
+        mcfg(mcfg_),
+        done_games(done_games_), total_games(total_games_),
+        ep(std::move(ep_)), results(results_),
+        os_mu(os_mu_), os(os_) {
+
+      const auto board = ep->env.board();
+
+      agmcts::MCTSConfig cfg_step = cfg_base;
+      cfg_step.seed = splitmix64(cfg_base.seed ^ ep->ep_seed ^ (std::uint64_t)ep->pr.steps);
+
+      S2048 root(board);
+      root.reward_from_parent_raw = 0.0;
+
+      search = std::make_unique<SearchTask>(cfg_step, model, root, max_inflight_per_task);
+    }
+
+    WorkOutcome pump(int sim_budget) override {
+      auto st = search->pump(std::max(1, sim_budget));
+
+      if (st == SearchTask::PumpStatus::Waiting) {
+        const uint64_t last = be->epoch();
+        be->wait_for_epoch_change(last, /*timeout_us=*/200);
+        return WorkOutcome::RequeueWaiting;
+      }
+
+      if (st != SearchTask::PumpStatus::Done) {
+        return WorkOutcome::RequeueProgress;
+      }
+
+      // Pick action from root visits
+      auto res = search->result();
+
+      std::array<float,4> pi = {0,0,0,0};
+      const double temp = mcfg->game.temperature;
+
+      if (temp <= 1e-12) {
+        int best_a = 0, best_v = -1;
+        for (const auto& e : res.root_entries) {
+          if (e.move.k != S2048::Move::Act) continue;
+          if (e.visits > best_v) { best_v = e.visits; best_a = (int)e.move.v; }
+        }
+        pi[best_a] = 1.0f;
+      } else {
+        auto dist = res.visit_distribution(temp);
+        for (auto& [mv, p] : dist) {
+          if (mv.k != S2048::Move::Act) continue;
+          pi[mv.v] = (float)p;
+        }
+      }
+
+      env2048::Action action;
+      if (temp <= 1e-12) {
+        int best = 0;
+        for (int a = 1; a < 4; ++a) if (pi[a] > pi[best]) best = a;
+        action = static_cast<env2048::Action>(best);
+      } else {
+        action = sample_action(pi, ep->sample_rng);
+      }
+
+      // Step environment
+      auto sr = ep->env.step(action, ep->game_rng);
+      if (!sr.moved) {
+        // defensive fallback
+        const std::uint8_t mask = ep->env.legal_actions_mask();
+        for (int a = 0; a < env2048::kNumActions; ++a) {
+          if (mask & (1u << a)) { ep->env.step((env2048::Action)a, ep->game_rng); break; }
+        }
+      }
+
+      ep->pr.steps += 1;
+      ep->pr.total_reward += sr.reward;
+      ep->pr.max_tile = std::max(ep->pr.max_tile, ep->env.max_tile());
+      ep->pr.final_board = ep->env.board();
+
+      const bool should_print =
+        (mcfg->print_game >= 0 && ep->id == mcfg->print_game) && mcfg->game.print_each_step;
+
+      if (should_print) {
+        std::lock_guard<std::mutex> lk(*os_mu);
+        (*os) << "\n[game " << ep->id << "] step " << ep->pr.steps
+              << " action=" << action_name(action)
+              << " reward=" << sr.reward
+              << " score=" << ep->env.score()
+              << " max_tile=" << ep->pr.max_tile << "\n";
+        print_board(ep->env.board(), *os);
+      }
+
+      const bool done =
+        ep->env.is_terminal() || (int)ep->pr.steps >= mcfg->game.max_steps;
+
+      if (!done) {
+        // enqueue next step-search
+        wq->push(std::make_unique<StepSearchWork>(
+          wq, model, be, cfg_base, max_inflight_per_task,
+          mcfg, done_games, total_games, ep, results, os_mu, os
+        ));
+        return WorkOutcome::Finished;
+      }
+
+      // finalize
+      (*results)[(size_t)ep->id] = ep->pr;
+
+      const int d = done_games->fetch_add(1) + 1;
+      if (d >= total_games) wq->stop();
+
+      return WorkOutcome::Finished;
+    }
+  };
+
+  // Header
+  {
+    std::lock_guard<std::mutex> lk(os_mu);
+    os << "=== 2048 play_many (MCTS) ===\n"
+       << "games=" << mcfg.games
+       << " sims=" << mcfg.game.sims
+       << " cpuct=" << mcfg.game.cpuct
+       << " temp=" << mcfg.game.temperature
+       << " eval_max_batch=" << mcfg.game.eval_max_batch
+       << " eval_max_wait_us=" << mcfg.game.eval_max_wait_us
+       << "\n";
+    if (mcfg.print_game >= 0) {
+      os << "printing game=" << mcfg.print_game
+         << " print_each_step=" << (mcfg.game.print_each_step ? "true" : "false")
+         << "\n";
+    }
+  }
+
+  // Initialize episodes (enqueue first step work for each)
+  for (int i = 0; i < mcfg.games; ++i) {
+    auto ep = std::make_shared<EpisodeCtx>();
+    ep->id = i;
+
+    ep->ep_seed = splitmix64(cfg_base.seed ^ (0xA5A5A5A5A5A5A5A5ull + (std::uint64_t)i));
+    ep->episode_seed = splitmix64(ep->ep_seed ^ 0xC3C3C3C3C3C3C3C3ull);
+
+    ep->game_rng   = env2048::RNG(splitmix64(ep->ep_seed ^ 0x1111111111111111ull));
+    ep->sample_rng = env2048::RNG(splitmix64(ep->ep_seed ^ 0x2222222222222222ull));
+
+    ep->env.reset(ep->game_rng, mcfg.game.initial_tiles);
+
+    ep->pr.final_board = ep->env.board();
+    ep->pr.max_tile = ep->env.max_tile();
+
+    if (mcfg.print_game >= 0 && i == mcfg.print_game && mcfg.print_initial_board) {
+      std::lock_guard<std::mutex> lk(os_mu);
+      os << "\n[game " << i << "] initial board:\n";
+      print_board(ep->env.board(), os);
+    }
+
+    wq.push(std::make_unique<StepSearchWork>(
+      &wq, &amodel, be, cfg_base, max_inflight_per_task,
+      &mcfg, &done_games, mcfg.games, ep, &out.results, &os_mu, &os
+    ));
+  }
+
+  // Worker pool
+  const int hw = (int)std::thread::hardware_concurrency();
+  const int workers = std::max(1, (mcfg.workers > 0) ? mcfg.workers : (hw > 0 ? hw : 1));
+
+  std::vector<std::thread> pool;
+  pool.reserve((size_t)workers);
+
+  for (int t = 0; t < workers; ++t) {
+    pool.emplace_back([&]{
+      while (true) {
+        auto item = wq.pop();
+        if (!item) break;
+
+        WorkOutcome r = item->pump(mcfg.sim_budget);
+        if (r == WorkOutcome::Finished) continue;
+
+        // requeue
+        wq.push(std::move(item));
+      }
+    });
+  }
+
+  for (auto& th : pool) th.join();
+
+  // Aggregates
+  double sum_r = 0.0;
+  double sum_s = 0.0;
+  std::uint32_t best_tile = 0;
+
+  for (const auto& r : out.results) {
+    sum_r += (double)r.total_reward;
+    sum_s += (double)r.steps;
+    best_tile = std::max(best_tile, r.max_tile);
+  }
+
+  out.avg_total_reward = sum_r / (double)out.results.size();
+  out.avg_steps = sum_s / (double)out.results.size();
+  out.best_max_tile = best_tile;
+
+  // -----------------------
+  // Max-tile statistics
+  // -----------------------
+  {
+    const double n = (double)out.results.size();
+
+    // exact distribution: max_tile == X
+    std::map<std::uint32_t, std::uint32_t> exact_counts;
+    for (const auto& r : out.results) exact_counts[r.max_tile] += 1;
+
+    out.max_tile_exact.clear();
+    out.max_tile_exact.reserve(exact_counts.size());
+    for (const auto& kv : exact_counts) {
+      const std::uint32_t tile = kv.first;
+      const std::uint32_t cnt  = kv.second;
+      out.max_tile_exact.push_back(TileStat{
+        tile,
+        cnt,
+        (n > 0.0 ? 100.0 * (double)cnt / n : 0.0)
+      });
+    }
+
+    // reach rate: max_tile >= threshold (128, 256, 512, ...)
+    const std::uint32_t cap = std::max<std::uint32_t>(2048u, best_tile);
+    std::vector<std::uint32_t> thresholds;
+    for (std::uint32_t t = 128; t != 0 && t <= cap; t <<= 1) thresholds.push_back(t);
+    if (thresholds.empty()) thresholds.push_back(128);
+
+    out.max_tile_at_least.clear();
+    out.max_tile_at_least.reserve(thresholds.size());
+    for (std::uint32_t t : thresholds) {
+      std::uint32_t cnt = 0;
+      for (const auto& r : out.results) if (r.max_tile >= t) ++cnt;
+
+      out.max_tile_at_least.push_back(TileStat{
+        t,
+        cnt,
+        (n > 0.0 ? 100.0 * (double)cnt / n : 0.0)
+      });
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(os_mu);
+
+    const auto old_flags = os.flags();
+    const auto old_prec  = os.precision();
+    os.setf(std::ios::fixed);
+    os.precision(2);
+
+    os << "\n=== play_many done ===\n"
+       << "avg_total_reward=" << out.avg_total_reward
+       << " avg_steps=" << out.avg_steps
+       << " best_max_tile=" << out.best_max_tile
+       << "\n";
+
+    os << "\nmax_tile distribution (exact):\n";
+    for (const auto& s : out.max_tile_exact) {
+      os << "  " << std::setw(6) << s.tile
+         << " : " << std::setw(6) << s.count
+         << "  (" << std::setw(6) << s.pct << "%)\n";
+    }
+
+    os << "\nmax_tile reach rate (>= tile):\n";
+    for (const auto& s : out.max_tile_at_least) {
+      os << "  >= " << std::setw(6) << s.tile
+         << " : " << std::setw(6) << s.count
+         << "  (" << std::setw(6) << s.pct << "%)\n";
+    }
+
+    os.flags(old_flags);
+    os.precision(old_prec);
+  }
+
+  return out;
 }
 
 } // namespace play2048

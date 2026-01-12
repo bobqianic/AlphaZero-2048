@@ -15,6 +15,9 @@ struct TrainerConfig {
     double lr = 3e-4;
 
     int64_t log_every = 100;
+
+    // if true, evaluate value on afterstates (chance nodes).
+    bool afterstate = true;
 };
 
 class Trainer {
@@ -43,6 +46,7 @@ private:
     torch::Tensor support_;
 
     // CPU (possibly pinned) staging buffers, reused each step
+    torch::Tensor xa_cpu_;   // [B, obs_dim]
     torch::Tensor xb_cpu_;   // [B, obs_dim]
     torch::Tensor pib_cpu_;  // [B, 4]
     torch::Tensor rt_cpu_;   // [B]

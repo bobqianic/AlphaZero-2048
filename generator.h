@@ -8,16 +8,22 @@
 #include "util/core/step.h"
 #include "util/logger.h"
 #include "util/cuda/encode2048.h"
+#include "util/core/mcts2048_common.h"
 
 #include <torch/torch.h>
 
-#include <array>
-#include <atomic>
+
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <thread>
-#include <vector>
+
+
+using mcts2048_common::S2048;
+using mcts2048_common::DiscountedReturnBackup;
+using mcts2048_common::BatchedEvaluator;
+using mcts2048_common::TorchAsyncMCTSModel;
+using mcts2048_common::splitmix64;
+using mcts2048_common::sample_action;
+
 
 struct GeneratorConfig {
     int episodes = 100;
@@ -38,6 +44,9 @@ struct GeneratorConfig {
 
     // RNG
     std::uint64_t seed = 1;
+
+    // if true, evaluate value on afterstates (chance nodes).
+    bool afterstate = true;
 };
 
 // Temperature schedule driven by train_step (same behavior as your original)

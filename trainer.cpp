@@ -66,6 +66,7 @@ void Trainer::ensure_cpu_buffers_() {
 
   if (xb_cpu_.defined() && xb_cpu_.sizes() == torch::IntArrayRef({B, (int64_t)rl2048::kObsDim})) return;
 
+  xa_cpu_  = torch::empty({B, (int64_t)rl2048::kObsDim}, cpu_f32_);
   xb_cpu_  = torch::empty({B, (int64_t)rl2048::kObsDim}, cpu_f32_);
   pib_cpu_ = torch::empty({B, 4}, cpu_f32_);
   rt_cpu_  = torch::empty({B}, cpu_f32_);
@@ -102,6 +103,7 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
     }
 
     // ---- Fill CPU staging tensors ----
+    float* xa_ptr  = xa_cpu_.data_ptr<float>();
     float* xb_ptr  = xb_cpu_.data_ptr<float>();
     float* pib_ptr = pib_cpu_.data_ptr<float>();
     float* rt_ptr  = rt_cpu_.data_ptr<float>();
@@ -111,6 +113,7 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
     for (int64_t b = 0; b < cfg_.batch; ++b) {
       const Step& s = batch_steps[(size_t)b];
 
+      rl2048::encode_board_31bit_inplace(s.after_board, xa_ptr + b * (int64_t)rl2048::kObsDim);
       rl2048::encode_board_31bit_inplace(s.board, xb_ptr + b * (int64_t)rl2048::kObsDim);
 
       pib_ptr[b * 4 + 0] = s.pi[0];
@@ -119,12 +122,18 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
       pib_ptr[b * 4 + 3] = s.pi[3];
 
       rt_ptr[b] = (float)s.reward;
-      vt_ptr[b] = (float)s.value_target;
+      if (cfg_.afterstate) {
+        constexpr float kDisc = 0.999f; // keep consistent with mcts2048_common::kDiscount
+        vt_ptr[b] = (float(s.value_target) - rt_ptr[b]) / kDisc; // afterstate target
+      } else {
+        vt_ptr[b] = (float)s.value_target; // normal target
+      }
 
       iw_ptr[b] = batch_isw[(size_t)b];
     }
 
     // ---- Upload once to device ----
+    auto xa  = xa_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
     auto xb  = xb_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
     auto pib = pib_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
     auto rt  = rt_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
@@ -141,6 +150,15 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
     //value_logits   [B,601]
     //reward_logits  [B,601]
 
+    torch::Tensor value_logits_used = value_logits;
+
+    if (cfg_.afterstate) {
+      torch::Tensor pl2, vl2, rl2;
+      AutocastGuard amp2(at::kCUDA, at::kBFloat16, true);
+      std::tie(pl2, vl2, rl2) = net_->forward(xa);
+      value_logits_used = vl2; // use afterstate value prediction
+    }
+
     // Policy loss per-sample: -sum(pi * log_softmax)
     auto logp = torch::log_softmax(policy_logits.to(torch::kFloat32), 1);
     auto policy_loss_per = -(pib * logp).sum(1); // [B]
@@ -150,19 +168,19 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
     auto yv_dev = yv_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
 
     auto v_dist = rl2048::scalar_to_support_dist(yv_dev, rl2048::kSupportMax); // [B,601]
-    auto logv = torch::log_softmax(value_logits.to(torch::kFloat32), 1);
+    auto logv = torch::log_softmax(value_logits_used.to(torch::kFloat32), 1);
     auto value_loss_per = -(v_dist * logv).sum(1); // [B]
 
     // ---- Reward target distribution ----
-    apply_muz_h_cpu_(rt_cpu_, yr_cpu_);
-    auto yr_dev = yr_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
-
-    auto r_dist = rl2048::scalar_to_support_dist(yr_dev, rl2048::kSupportMax); // [B,601]
-    auto logr = torch::log_softmax(reward_logits.to(torch::kFloat32), 1);
-    auto reward_loss_per = -(r_dist * logr).sum(1); // [B]
+    // apply_muz_h_cpu_(rt_cpu_, yr_cpu_);
+    // auto yr_dev = yr_cpu_.to(device_, /*non_blocking=*/device_.is_cuda());
+    //
+    // auto r_dist = rl2048::scalar_to_support_dist(yr_dev, rl2048::kSupportMax); // [B,601]
+    // auto logr = torch::log_softmax(reward_logits.to(torch::kFloat32), 1);
+    // auto reward_loss_per = -(r_dist * logr).sum(1); // [B]
 
     // Total per-sample loss with importance weights
-    auto total_loss_per = policy_loss_per + value_loss_per + reward_loss_per;
+    auto total_loss_per = policy_loss_per + value_loss_per; //+ reward_loss_per;
     auto loss = (total_loss_per * iw).mean();
 
     opt_.zero_grad();
@@ -173,7 +191,7 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
     {
       torch::NoGradGuard ng;
 
-      auto pred_v_raw = rl2048::decode_value_raw(value_logits, support_, rl2048::kEpsTransform); // [B]
+      auto pred_v_raw = rl2048::decode_value_raw(value_logits_used, support_, rl2048::kEpsTransform); // [B]
       auto err_cpu = (pred_v_raw - vt).abs().add(1e-6).to(torch::kCPU).contiguous();
 
       std::vector<float> new_p((size_t)cfg_.batch);
@@ -190,7 +208,7 @@ void Trainer::train_steps(ReplayBuffer& replay, int64_t num_steps, std::uint64_t
            " loss=", loss.item<double>(),
            " (policy=", policy_loss_per.mean().item<double>(),
            " value=",  value_loss_per.mean().item<double>(),
-           " reward=", reward_loss_per.mean().item<double>(),
+           //" reward=", reward_loss_per.mean().item<double>(),
            ")");
     }
 

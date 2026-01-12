@@ -1,0 +1,523 @@
+#pragma once
+// Shared MCTS + batched evaluator utilities used by generator.cpp and play.cpp
+
+#include "env2048.h"
+#include "mcts.h"
+#include "../../model.h"
+#include "../cuda/encode2048.h"
+
+#include <ATen/cuda/CUDAEvent.h>
+#include <ATen/autocast_mode.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace mcts2048_common {
+
+static constexpr double kDiscount = 0.999;
+
+// ---------------------------
+// 2048 state for MCTS
+// ---------------------------
+struct S2048 {
+  using Player = int;
+
+  double gamma_from_parent = kDiscount;
+
+  struct Move {
+    enum Kind : std::uint8_t { Act = 0, Spawn = 1 } k;
+    std::uint8_t v; // Act: 0..3, Spawn: 0..31
+
+    bool operator==(const Move& o) const { return k == o.k && v == o.v; }
+  };
+
+  env2048::Env env;
+
+  // Reward from parent transition (for backup)
+  double reward_from_parent_raw = 0.0;
+
+  enum Phase : std::uint8_t { PlayerPhase = 0, ChancePhase = 1 } phase = PlayerPhase;
+
+  std::array<env2048::ChanceOutcome, 32> outs{};
+  std::size_t out_n = 0;
+
+  S2048() = default;
+  explicit S2048(env2048::Env::Board b) : env(b), phase(PlayerPhase) {}
+
+  Player current_player() const { return 0; }
+
+  bool is_chance_node() const { return phase == ChancePhase; }
+
+  bool is_terminal() const {
+    // Only meaningful at player decision points (after a spawn)
+    return phase == PlayerPhase && env.is_terminal();
+  }
+
+  double terminal_value(Player /*perspective*/) const { return 0.0; }
+
+  std::vector<Move> legal_moves() const {
+    std::vector<Move> m;
+    if (phase == PlayerPhase) {
+      const std::uint8_t mask = env.legal_actions_mask();
+      for (int a = 0; a < env2048::kNumActions; ++a) {
+        if (mask & (1u << a)) m.push_back(Move{Move::Act, (std::uint8_t)a});
+      }
+    } else {
+      for (std::size_t i = 0; i < out_n; ++i) {
+        m.push_back(Move{Move::Spawn, (std::uint8_t)i});
+      }
+    }
+    return m;
+  }
+
+  // Priors for chance node expansion (probabilities of spawn outcomes)
+  std::vector<std::pair<Move, double>> chance_priors() const {
+    std::vector<std::pair<Move, double>> p;
+    p.reserve(out_n);
+    for (std::size_t i = 0; i < out_n; ++i) {
+      p.push_back({Move{Move::Spawn, (std::uint8_t)i}, (double)outs[i].prob});
+    }
+    return p;
+  }
+
+  void apply_move(const Move& mv) {
+    if (phase == PlayerPhase) {
+      // Deterministic move only (NO spawn here)
+      auto r = env.move((env2048::Action)mv.v);
+      reward_from_parent_raw = (double)r.reward;
+
+      // legal_moves() should guarantee moved==true, but be safe
+      if (!r.moved) {
+        reward_from_parent_raw = 0.0;
+        return;
+      }
+
+      gamma_from_parent = kDiscount;
+
+      // Enumerate stochastic outcomes and switch to chance node
+      out_n = env.enumerate_spawns(outs);
+      phase = ChancePhase;
+      return;
+    } else {
+      // Chance phase: apply chosen spawn outcome
+      env.set_board(outs[mv.v].board);
+      reward_from_parent_raw = 0.0;
+      gamma_from_parent = 1.0;
+      phase = PlayerPhase;
+      return;
+    }
+  }
+};
+
+// ---------------------------
+// Backup strategy: discounted return (single-agent)
+// ---------------------------
+template <class State, class Payload>
+struct DiscountedReturnBackup {
+  using EvalPayload = Payload;
+  using BackupValue = double;
+
+  static BackupValue make_leaf_value(double leaf_value,
+                                     const EvalPayload* /*payload*/,
+                                     const State& /*leaf_state*/) {
+    return leaf_value;
+  }
+
+  static BackupValue move_to_parent(const BackupValue& v_child,
+                                   const State& /*parent_state*/,
+                                   const State& child_state) {
+    const double r = child_state.reward_from_parent_raw;
+    const double gamma = child_state.gamma_from_parent;
+    return r + gamma * v_child;
+  }
+
+  static void update_node(agmcts::Node<State, DiscountedReturnBackup>& node,
+                          const BackupValue& /*v*/) {
+    node.N += 1;
+  }
+
+  static void update_edge(agmcts::Edge<State, DiscountedReturnBackup>& edge,
+                          const BackupValue& v_child) {
+    if (!edge.child) return;
+    const auto& child_state = edge.child->state;
+
+    const double r = child_state.reward_from_parent_raw;
+    const double gamma = child_state.gamma_from_parent;
+
+    const double v_edge = r + gamma * v_child;
+
+    edge.N += 1;
+    edge.W += v_edge;
+    edge.Q = edge.W / std::max(1, edge.N);
+  }
+};
+
+// ---------------------------
+// Async Batched Evaluator (submit + poll)
+// ---------------------------
+struct EvalOut {
+  std::array<double, 4> policy{};
+  double value = 0.0;
+};
+
+struct EvalHandle {
+  env2048::Env::Board board{};
+  EvalOut out{};
+  std::atomic<bool> ready{false};
+};
+
+struct AutocastGuard {
+  at::DeviceType device_type;
+  bool prev_enabled;
+  at::ScalarType prev_dtype;
+
+  AutocastGuard(at::DeviceType dt, at::ScalarType dtype, bool enabled = true)
+      : device_type(dt),
+        prev_enabled(at::autocast::is_autocast_enabled(dt)),
+        prev_dtype(at::autocast::get_autocast_dtype(dt)) {
+    at::autocast::set_autocast_enabled(dt, enabled);
+    at::autocast::set_autocast_dtype(dt, dtype);
+  }
+
+  ~AutocastGuard() {
+    at::autocast::set_autocast_dtype(device_type, prev_dtype);
+    at::autocast::set_autocast_enabled(device_type, prev_enabled);
+  }
+};
+
+class BatchedEvaluator {
+public:
+  BatchedEvaluator(rl2048::Net net,
+                   torch::Device device,
+                   int max_batch,
+                   int max_wait_us,
+                   int slots = 8)
+      : net_(std::move(net)),
+        device_(device),
+        max_batch_(std::max(1, max_batch)),
+        max_wait_us_(std::max(1, max_wait_us)),
+        slots_used_(std::clamp(slots, 1, kMaxSlots)) {
+
+    net_->to(device_);
+    net_->eval();
+
+    support_ = torch::arange(
+                 0, rl2048::kSupportMax + 1,
+                 torch::TensorOptions().dtype(torch::kFloat32).device(device_))
+                 .view({1, -1});
+
+    init_slots();
+    worker_ = std::thread([this] { loop(); });
+  }
+
+  ~BatchedEvaluator() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+  }
+
+  std::shared_ptr<EvalHandle> submit(env2048::Env::Board b) {
+    auto h = std::make_shared<EvalHandle>();
+    h->board = b;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      q_.push_back(h);
+    }
+    cv_.notify_one();
+    return h;
+  }
+
+  uint64_t epoch() const { return epoch_.load(std::memory_order_relaxed); }
+
+  void wait_for_epoch_change(uint64_t last_epoch, int timeout_us) {
+    std::unique_lock<std::mutex> lk(epoch_mu_);
+    epoch_cv_.wait_for(
+      lk,
+      std::chrono::microseconds(timeout_us),
+      [&] { return epoch_.load(std::memory_order_relaxed) != last_epoch; }
+    );
+  }
+
+private:
+  rl2048::Net net_;
+  torch::Device device_;
+  int max_batch_;
+  int max_wait_us_;
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::shared_ptr<EvalHandle>> q_;
+  bool stop_ = false;
+  std::thread worker_;
+
+  torch::Tensor support_;
+
+  std::atomic<uint64_t> epoch_{0};
+  std::mutex epoch_mu_;
+  std::condition_variable epoch_cv_;
+
+  struct Slot {
+    torch::Tensor boards_pinned; // [maxB] pinned CPU int64
+    torch::Tensor boards_dev;    // [maxB] GPU int64
+
+    torch::Tensor xb_dev;        // [maxB, obs] GPU float32
+    torch::Tensor p_pinned;      // [maxB, 4] pinned CPU float
+    torch::Tensor v_pinned;      // [maxB] pinned CPU float
+
+    std::optional<at::cuda::CUDAStream> stream;
+    at::cuda::CUDAEvent done;
+
+    bool in_use = false;
+    int B = 0;
+    std::vector<std::shared_ptr<EvalHandle>> batch;
+  };
+
+  static constexpr int kMaxSlots = 8;
+  int slots_used_ = kMaxSlots;
+  std::array<Slot, kMaxSlots> slots_{};
+
+  void init_slots() {
+    auto pinned_f32 = torch::TensorOptions()
+                    .dtype(torch::kFloat32)
+                    .device(torch::kCPU)
+                    .pinned_memory(true);
+
+    auto pinned_i64 = torch::TensorOptions()
+                        .dtype(torch::kInt64)
+                        .device(torch::kCPU)
+                        .pinned_memory(true);
+
+    auto dev_i64 = torch::TensorOptions()
+                     .dtype(torch::kInt64)
+                     .device(device_);
+
+    auto dev_f32 = torch::TensorOptions()
+                     .dtype(torch::kFloat32)
+                     .device(device_);
+
+    for (int i = 0; i < slots_used_; ++i) {
+      auto& s = slots_[i];
+      s.boards_pinned = torch::empty({max_batch_}, pinned_i64);
+      s.boards_dev    = torch::empty({max_batch_}, dev_i64);
+
+      s.xb_dev        = torch::empty({max_batch_, (int64_t)rl2048::kObsDim}, dev_f32);
+
+      s.p_pinned      = torch::empty({max_batch_, 4}, pinned_f32);
+      s.v_pinned      = torch::empty({max_batch_}, pinned_f32);
+
+      s.stream = at::cuda::getStreamFromPool(false, device_.index());
+    }
+  }
+
+  std::vector<std::shared_ptr<EvalHandle>> take_batch_from_queue() {
+    using clock = std::chrono::steady_clock;
+
+    std::vector<std::shared_ptr<EvalHandle>> batch;
+    batch.reserve((size_t)max_batch_);
+
+    auto drain = [&] {
+      while (!q_.empty() && (int)batch.size() < max_batch_) {
+        batch.emplace_back(std::move(q_.front()));
+        q_.pop_front();
+      }
+    };
+
+    auto any_in_flight = [&] {
+      for (int i = 0; i < slots_used_; ++i) if (slots_[i].in_use) return true;
+      return false;
+    };
+
+    std::unique_lock<std::mutex> lk(mu_);
+
+    if (q_.empty() && !stop_) {
+      if (any_in_flight()) {
+        cv_.wait_for(lk, std::chrono::microseconds(200),
+                     [&] { return stop_ || !q_.empty(); });
+      } else {
+        cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+      }
+    }
+
+    if (stop_ && q_.empty()) return batch;
+    if (q_.empty()) return batch;
+
+    drain();
+
+    const auto deadline = clock::now() + std::chrono::microseconds(max_wait_us_);
+
+    while (!stop_ && (int)batch.size() < max_batch_) {
+      if (clock::now() >= deadline) break;
+
+      if (q_.empty()) {
+        if (!cv_.wait_until(lk, deadline, [&] { return stop_ || !q_.empty(); })) break;
+      }
+      drain();
+    }
+
+    return batch;
+  }
+
+  void loop() {
+    torch::InferenceMode im;
+    at::cuda::CUDAGuard device_guard(device_.index());
+
+    while (true) {
+      // 1) Retire completed slots (non-blocking)
+      for (int si = 0; si < slots_used_; ++si) {
+        auto& s = slots_[si];
+        if (!s.in_use || !s.done.query()) continue;
+
+        auto p_view = s.p_pinned.narrow(0, 0, s.B);
+        auto v_view = s.v_pinned.narrow(0, 0, s.B);
+
+        const float* pptr = p_view.data_ptr<float>();
+        const float* vptr = v_view.data_ptr<float>();
+
+        for (int i = 0; i < s.B; ++i) {
+          auto& h = s.batch[i];
+          for (int a = 0; a < 4; ++a) h->out.policy[a] = pptr[i * 4 + a];
+          h->out.value = (double)vptr[i];
+          h->ready.store(true, std::memory_order_release);
+        }
+
+        s.batch.clear();
+        s.in_use = false;
+
+        epoch_.fetch_add(1, std::memory_order_relaxed);
+        epoch_cv_.notify_all();
+      }
+
+      // 2) Find a free slot
+      Slot* slot = nullptr;
+      for (int si = 0; si < slots_used_; ++si) {
+        if (!slots_[si].in_use) { slot = &slots_[si]; break; }
+      }
+
+      // If no slot is free, block until some in-flight batch finishes.
+      if (!slot) {
+        for (int si = 0; si < slots_used_; ++si) {
+          if (slots_[si].in_use) { slots_[si].done.synchronize(); break; }
+        }
+        continue;
+      }
+
+      // 3) Build batch from queue
+      auto batch = take_batch_from_queue();
+      if (batch.empty()) {
+        if (stop_) return;
+        continue;
+      }
+
+      slot->B = (int)batch.size();
+      slot->batch = std::move(batch);
+      slot->in_use = true;
+
+      auto b_cpu = slot->boards_pinned.narrow(0, 0, slot->B);
+      int64_t* bptr = b_cpu.data_ptr<int64_t>();
+      for (int i = 0; i < slot->B; ++i) {
+        bptr[i] = (int64_t)slot->batch[i]->board; // preserve bit pattern
+      }
+
+      // 4) Launch GPU work on this slot’s stream
+      {
+        c10::cuda::CUDAStreamGuard sg(slot->stream.value().unwrap());
+
+        auto b_dev  = slot->boards_dev.narrow(0, 0, slot->B);
+        auto xb_dev = slot->xb_dev.narrow(0, 0, slot->B);
+
+        b_dev.copy_(b_cpu, /*non_blocking=*/true);
+
+        encode2048_onehot31_out_cuda(b_dev, xb_dev);
+
+        torch::Tensor pl, vl, rl;
+        {
+          AutocastGuard amp(at::kCUDA, at::kBFloat16, true);
+          std::tie(pl, vl, rl) = net_->forward(xb_dev);
+        }
+
+        auto p_dev = torch::softmax(pl.to(torch::kFloat32), 1);
+        auto v_dev = rl2048::decode_value_raw(
+            vl.to(torch::kFloat32), support_, rl2048::kEpsTransform);
+
+        auto p_cpu = slot->p_pinned.narrow(0, 0, slot->B);
+        auto v_cpu = slot->v_pinned.narrow(0, 0, slot->B);
+
+        p_cpu.copy_(p_dev, /*non_blocking=*/true);
+        v_cpu.copy_(v_dev, /*non_blocking=*/true);
+
+        slot->done.record();
+      }
+    }
+  }
+};
+
+// ---------------------------
+// Async model wrapper for mcts_task
+// ---------------------------
+struct TorchAsyncMCTSModel {
+  using Ticket = std::shared_ptr<EvalHandle>;
+  std::shared_ptr<BatchedEvaluator> be;
+
+  explicit TorchAsyncMCTSModel(std::shared_ptr<BatchedEvaluator> eval) : be(std::move(eval)) {
+    if (!be) throw std::runtime_error("TorchAsyncMCTSModel: BatchedEvaluator is null");
+  }
+
+  Ticket submit(const S2048& s) { return be->submit(s.env.board()); }
+
+  bool poll(const Ticket& t, agmcts::Evaluation<S2048::Move, agmcts::NoPayload>* out) {
+    if (!t->ready.load(std::memory_order_acquire)) return false;
+
+    const EvalOut& o = t->out;
+    out->value = o.value;
+    out->policy = {
+      {S2048::Move{S2048::Move::Act, 0}, o.policy[0]}, // Up
+      {S2048::Move{S2048::Move::Act, 1}, o.policy[1]}, // Right
+      {S2048::Move{S2048::Move::Act, 2}, o.policy[2]}, // Down
+      {S2048::Move{S2048::Move::Act, 3}, o.policy[3]}, // Left
+    };
+    return true;
+  }
+};
+
+// ---------------------------
+// Common helpers
+// ---------------------------
+static inline std::uint64_t splitmix64(std::uint64_t x) {
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
+static inline env2048::Action sample_action(const std::array<float,4>& probs, env2048::RNG& rng) {
+  const double u = double(rng.next_u32_raw()) / 4294967296.0;
+  double c = 0.0;
+  for (int a = 0; a < 4; ++a) {
+    c += probs[a];
+    if (u <= c) return static_cast<env2048::Action>(a);
+  }
+  int best = 0;
+  for (int a = 1; a < 4; ++a) if (probs[a] > probs[best]) best = a;
+  return static_cast<env2048::Action>(best);
+}
+
+} // namespace mcts2048_common

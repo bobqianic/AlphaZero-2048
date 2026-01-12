@@ -41,6 +41,7 @@ static void usage() {
     "main [--mode train|play] --ckpt <dir-or-file.pt> [--device cpu|cuda]\n"
     "     [--log <logfile>]\n"
     "     [--resume 0|1]\n"
+    "     [--afterstate 0|1]            (global; default 0)\n"
     "\n"
     "PLAY MODE OPTIONS:\n"
     "     [--play_sims 800]\n"
@@ -48,6 +49,13 @@ static void usage() {
     "     [--play_temp 0.0]\n"
     "     [--play_max_steps 1000000]\n"
     "     [--play_print 0|1]\n"
+    "\n"
+    "     Multi-game (shared evaluator, batched GPU eval across games):\n"
+    "     [--play_games 1]              (if >1, uses play_many)\n"
+    "     [--play_workers 0]            (0=hw concurrency)\n"
+    "     [--play_sim_budget 16]        (sims per pump() before requeue)\n"
+    "     [--play_print_game -1]        (-1=none; otherwise print that game only)\n"
+    "     [--play_print_initial 0|1]    (print initial board for print_game)\n"
     "\n"
     "TRAIN MODE OPTIONS:\n"
     "     [--iters 100]\n"
@@ -121,6 +129,7 @@ int main(int argc, char** argv) {
   std::string log_arg  = "run.log";
   std::string device_str = "cuda";
   bool resume = true;
+  bool use_afterstate = false; // default: DO NOT use afterstate
 
   // ---- Play mode options ----
   int play_sims = 800;
@@ -128,6 +137,13 @@ int main(int argc, char** argv) {
   double play_temp = 0.0;
   int play_max_steps = 1000000;
   bool play_print = true;
+
+  // ---- Multi-play options ----
+  int play_games = 1;            // if >1 => play_many
+  int play_workers = 0;          // 0 => hw concurrency inside play_many
+  int play_sim_budget = 16;      // per work-item pump() budget
+  int play_print_game = -1;      // -1 => none
+  bool play_print_initial = false;
 
   // ---- Train mode options ----
   int iters = 5000;
@@ -167,6 +183,7 @@ int main(int argc, char** argv) {
     else if (a == "--log") log_arg = need("--log");
     else if (a == "--device") device_str = need("--device");
     else if (a == "--resume") resume = (std::stoi(need("--resume")) != 0);
+    else if (a == "--afterstate") use_afterstate = (std::stoi(need("--afterstate")) != 0);
 
     // play flags
     else if (a == "--play_sims") play_sims = std::max(1, std::stoi(need("--play_sims")));
@@ -174,6 +191,13 @@ int main(int argc, char** argv) {
     else if (a == "--play_temp") play_temp = std::stod(need("--play_temp"));
     else if (a == "--play_max_steps") play_max_steps = std::max(1, std::stoi(need("--play_max_steps")));
     else if (a == "--play_print") play_print = (std::stoi(need("--play_print")) != 0);
+
+    // multi-play flags
+    else if (a == "--play_games") play_games = std::max(1, std::stoi(need("--play_games")));
+    else if (a == "--play_workers") play_workers = std::max(0, std::stoi(need("--play_workers")));
+    else if (a == "--play_sim_budget") play_sim_budget = std::max(1, std::stoi(need("--play_sim_budget")));
+    else if (a == "--play_print_game") play_print_game = std::stoi(need("--play_print_game"));
+    else if (a == "--play_print_initial") play_print_initial = (std::stoi(need("--play_print_initial")) != 0);
 
     // train flags
     else if (a == "--iters") iters = std::stoi(need("--iters"));
@@ -211,6 +235,7 @@ int main(int argc, char** argv) {
 
   logf(*logger, "Log file: ", log_path.string());
   logf(*logger, "Checkpoint directory: ", ckpt_dir.string(), " (prefix=", ckpt_prefix, ")");
+  logf(*logger, "Afterstate: ", (use_afterstate ? "ON" : "OFF"));
 
   torch::Device device = torch::kCPU;
   if (device_str == "cuda") {
@@ -262,19 +287,47 @@ int main(int argc, char** argv) {
     pcfg.temperature = play_temp;
     pcfg.max_steps = play_max_steps;
     pcfg.print_each_step = play_print;
-    pcfg.seed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    pcfg.seed = (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::high_resolution_clock::now().time_since_epoch()
                 ).count();
+    pcfg.afterstate = use_afterstate;
 
     logf(*logger, "Play cfg: sims=", pcfg.sims,
          " cpuct=", pcfg.cpuct,
          " temp=", pcfg.temperature,
          " max_steps=", pcfg.max_steps,
          " print=", (pcfg.print_each_step ? 1 : 0),
+         " afterstate=", (pcfg.afterstate ? 1 : 0),
          " seed=", pcfg.seed);
 
     trainer.net()->eval();
-    play2048::play(trainer.net(), device, pcfg, std::cout);
+
+    // If play_games > 1, use play_many() (shared evaluator, better GPU utilization).
+    if (play_games > 1) {
+      play2048::MultiPlayConfig mpcfg;
+      mpcfg.game = pcfg;
+      mpcfg.games = play_games;
+      mpcfg.workers = play_workers;
+      mpcfg.sim_budget = play_sim_budget;
+
+      // Interpret --play_print as "print one game", defaulting to game 0 if unspecified.
+      int pg = play_print_game;
+      if (pcfg.print_each_step && pg < 0) pg = 0;
+
+      mpcfg.print_game = pg;
+      mpcfg.print_initial_board = play_print_initial;
+
+      logf(*logger, "Play-many cfg: games=", mpcfg.games,
+           " workers=", mpcfg.workers,
+           " sim_budget=", mpcfg.sim_budget,
+           " print_game=", mpcfg.print_game,
+           " print_initial=", (mpcfg.print_initial_board ? 1 : 0));
+
+      play2048::play_many(trainer.net(), device, mpcfg, std::cout);
+    } else {
+      play2048::play(trainer.net(), device, pcfg, std::cout);
+    }
+
     return 0;
   }
 
@@ -299,6 +352,7 @@ int main(int argc, char** argv) {
   gcfg.sims = sims;
   gcfg.workers = workers;
   gcfg.seed = seed;
+  gcfg.afterstate = use_afterstate;
 
   Generator generator(trainer.net(), device, gcfg, logger);
 

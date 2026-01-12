@@ -4,7 +4,9 @@
 #include <cstdint>
 
 struct Step {
-    std::uint64_t board = 0;
+    std::uint64_t board = 0;        // BEFORE action (player decision state)
+    std::uint64_t after_board = 0;  // AFTER deterministic move, BEFORE spawn (afterstate)
+
     std::uint8_t action = 0;
 
     // Targets / labels
